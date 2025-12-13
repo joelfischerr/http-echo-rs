@@ -1,0 +1,6 @@
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,../ModSecurity/_install/lib/"]
+
+[env]
+PKG_CONFIG_PATH = {value = "../ModSecurity/_install/lib/pkgconfig/", relative = true}
+LD_LIBRARY_PATH = {value = "../ModSecurity/_install/lib/", relative = true}
