@@ -1,16 +1,24 @@
 use anyhow::Result;
 use axum::{
-    body::Bytes,
-    http::{HeaderMap, HeaderName, StatusCode},
-    response::IntoResponse,
-    routing::post,
     Router,
+    body::{Body, Bytes},
+    extract::{Request, State},
+    http::{HeaderMap, HeaderName, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::post,
 };
 use clap::Parser;
-use std::{collections::HashMap, str::FromStr, time::Duration};
-use tokio::signal::unix::{signal, SignalKind};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use tokio::signal::unix::{SignalKind, signal};
 
 use modsecurity::{ModSecurity, Rules};
+
+// #[derive(Clone)]
+struct AppState {
+    ms: ModSecurity,
+    rules: Rules,
+}
 
 #[derive(Parser)]
 struct Args {
@@ -72,11 +80,6 @@ async fn main() {
         echo(res_hdrs, body)
     });
 
-    // build our application with a route
-    let app = Router::new()
-        .route("/", echo.clone())
-        .route("/{path}", echo);
-
     let ms = ModSecurity::default();
 
     let mut rules = Rules::new();
@@ -90,6 +93,75 @@ async fn main() {
         )
         .expect("Failed to add rules");
 
+    test_modsecurity(&ms, &rules);
+
+    let state: Arc<AppState> = Arc::new(AppState {
+        ms: ms,
+        rules: rules,
+    });
+
+    // build our application with a route
+    let app = Router::new()
+        .route("/", echo.clone())
+        .route("/{path}", echo)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            execute_modsecurity,
+        ));
+
+    let listener = tokio::net::TcpListener::bind(address.clone())
+        .await
+        .unwrap();
+    log::info!("Listening on {}", address);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn execute_modsecurity(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Request,
+    _next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    let mut transaction = state
+        .ms
+        .transaction_builder()
+        .with_rules(&state.rules)
+        .build()
+        .unwrap();
+
+    let request_http_version = format!("{:?}", request.version()).to_string();
+
+    transaction
+        .process_connection("127.0.0.1", 1234, "127.0.0.1", 8080)
+        .unwrap();
+    transaction
+        .process_uri(
+            &request.uri().to_string(),
+            &request.method().to_string(),
+            &request_http_version,
+        )
+        .unwrap();
+    for (key, val) in headers.iter() {
+        transaction
+            .add_request_header(&key.to_string(), &val.to_str().unwrap())
+            .unwrap();
+    }
+    transaction.process_request_headers().unwrap();
+
+    // let body_bytes =
+
+    // The idea for the body is to get the whole body, do ModSecurity and then copy the body back into the request.
+    // This seems super wasteful, but is what axum has in their examples: https://github.com/tokio-rs/axum/blob/3b92cd7593a900d3c79c2aeb411f90be052a9a5c/examples/consume-body-in-extractor-or-middleware/src/main.rs#L58
+    // transaction.append_request_body(request.body().into_data_stream();
+    transaction.process_request_body().unwrap();
+
+    Err(StatusCode::UNAUTHORIZED)
+}
+
+fn test_modsecurity(ms: &ModSecurity, rules: &Rules) {
     let mut transaction = ms
         .transaction_builder()
         .with_rules(&rules)
@@ -106,15 +178,6 @@ async fn main() {
     let intervention = transaction.intervention().expect("Expected intervention");
 
     assert_eq!(intervention.status(), 401);
-
-    let listener = tokio::net::TcpListener::bind(address.clone())
-        .await
-        .unwrap();
-    log::info!("Listening on {}", address);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
 }
 
 async fn echo(headers: HeaderMap, body: Bytes) -> Result<impl IntoResponse, StatusCode> {
