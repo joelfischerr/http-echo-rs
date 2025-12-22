@@ -34,6 +34,9 @@ struct Args {
 
     #[arg(short = 'd', long = "us-delay", default_value = "0")]
     delay_us: u64,
+
+    #[arg(short = 'r', long = "rules", num_args = 1.., value_delimiter = ' ')]
+    rules_vec: Vec<String>,
 }
 
 #[tokio::main]
@@ -46,6 +49,7 @@ async fn main() {
         headers,
         header_echos,
         delay_us,
+        rules_vec,
     } = Args::parse();
 
     let headers = headers
@@ -81,23 +85,7 @@ async fn main() {
         echo(res_hdrs, body)
     });
 
-    let ms = ModSecurity::default();
-
-    let mut rules = Rules::new();
-    rules
-        .add_plain(
-            r#"
-        SecRuleEngine On
-
-        SecRule REQUEST_URI "@rx admin" "id:1,phase:1,deny,status:401"
-    "#,
-        )
-        .expect("Failed to add rules");
-
-    test_modsecurity(&ms, &rules);
-
-    let rules = vec!["".to_string()];
-    let state: Arc<AppState> = configure_modsecurity_to_state(rules);
+    let state: Arc<AppState> = configure_modsecurity_to_state(rules_vec);
 
     // build our application with a route
     let app = Router::new()
@@ -119,7 +107,7 @@ async fn main() {
 }
 
 // TODO: Actually load the configured rules
-fn configure_modsecurity_to_state(_rules: Vec<String>) -> Arc<AppState> {
+fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
     let ms = ModSecurity::default();
 
     let mut rules = Rules::new();
@@ -134,6 +122,10 @@ fn configure_modsecurity_to_state(_rules: Vec<String>) -> Arc<AppState> {
         .expect("Failed to add rules");
 
     test_modsecurity(&ms, &rules);
+
+    for rule in rules_vec.iter() {
+        rules.add_file(rule).expect("Adding rules failed!");
+    }
 
     let state: Arc<AppState> = Arc::new(AppState {
         ms: ms,
@@ -156,7 +148,16 @@ async fn execute_modsecurity(
         .build()
         .unwrap();
 
-    let request_http_version = format!("{:?}", request.version()).to_string();
+    println!(
+        "Our request version is {} {:?}",
+        &request.method().to_string(),
+        request.version()
+    );
+
+    let request_http_version = format!("{:?}", request.version())
+        .strip_prefix("HTTP/")
+        .unwrap()
+        .to_string();
 
     transaction
         .process_connection("127.0.0.1", 1234, "127.0.0.1", 8080)
