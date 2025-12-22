@@ -1,16 +1,17 @@
 use anyhow::Result;
 use axum::{
-    Router,
     body::{Body, Bytes},
     extract::{Request, State},
     http::{HeaderMap, HeaderName, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
+    Router,
 };
 use clap::Parser;
+use http_body_util::BodyExt;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{signal, SignalKind};
 
 use modsecurity::{ModSecurity, Rules};
 
@@ -95,10 +96,8 @@ async fn main() {
 
     test_modsecurity(&ms, &rules);
 
-    let state: Arc<AppState> = Arc::new(AppState {
-        ms: ms,
-        rules: rules,
-    });
+    let rules = vec!["".to_string()];
+    let state: Arc<AppState> = configure_modsecurity_to_state(rules);
 
     // build our application with a route
     let app = Router::new()
@@ -119,11 +118,36 @@ async fn main() {
         .unwrap();
 }
 
+// TODO: Actually load the configured rules
+fn configure_modsecurity_to_state(_rules: Vec<String>) -> Arc<AppState> {
+    let ms = ModSecurity::default();
+
+    let mut rules = Rules::new();
+    rules
+        .add_plain(
+            r#"
+    SecRuleEngine On
+
+    SecRule REQUEST_URI "@rx admin" "id:1,phase:1,deny,status:401"
+"#,
+        )
+        .expect("Failed to add rules");
+
+    test_modsecurity(&ms, &rules);
+
+    let state: Arc<AppState> = Arc::new(AppState {
+        ms: ms,
+        rules: rules,
+    });
+
+    return state;
+}
+
 async fn execute_modsecurity(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     request: Request,
-    _next: Next,
+    next: Next,
 ) -> Result<Response<Body>, StatusCode> {
     let mut transaction = state
         .ms
@@ -150,15 +174,78 @@ async fn execute_modsecurity(
             .unwrap();
     }
     transaction.process_request_headers().unwrap();
+    if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
+        return Err(raw_status_code);
+    }
 
-    // let body_bytes =
+    let (parts, body) = request.into_parts();
+
+    let bytes: Bytes = body
+        .collect()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
+        .unwrap()
+        .to_bytes();
 
     // The idea for the body is to get the whole body, do ModSecurity and then copy the body back into the request.
     // This seems super wasteful, but is what axum has in their examples: https://github.com/tokio-rs/axum/blob/3b92cd7593a900d3c79c2aeb411f90be052a9a5c/examples/consume-body-in-extractor-or-middleware/src/main.rs#L58
-    // transaction.append_request_body(request.body().into_data_stream();
+    transaction.append_request_body(&bytes).unwrap();
     transaction.process_request_body().unwrap();
 
-    Err(StatusCode::UNAUTHORIZED)
+    if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
+        return Err(raw_status_code);
+    }
+
+    let new_body = Body::from(bytes);
+    let reassembled_request = Request::from_parts(parts, new_body);
+
+    let response = next.run(reassembled_request).await;
+
+    let response_http_version = format!("{:?}", response.version()).to_string();
+
+    for (key, val) in response.headers().iter() {
+        transaction
+            .add_response_header(&key.to_string(), &val.to_str().unwrap())
+            .unwrap();
+    }
+    transaction
+        .process_response_headers(response.status().as_u16().into(), &response_http_version)
+        .unwrap();
+
+    if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
+        return Err(raw_status_code);
+    }
+
+    let (parts, body) = response.into_parts();
+
+    let bytes: Bytes = body
+        .collect()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
+        .unwrap()
+        .to_bytes();
+
+    transaction.append_request_body(&bytes).unwrap();
+    transaction.process_response_body().unwrap();
+
+    if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
+        return Err(raw_status_code);
+    }
+
+    let new_body = Body::from(bytes);
+    let new_response = Response::from_parts(parts, new_body);
+
+    return Ok(new_response);
+}
+
+fn check_for_intervention(transaction: &mut modsecurity::Transaction) -> Option<StatusCode> {
+    if let Some(intervention) = transaction.intervention() {
+        if intervention.disruptive() {
+            let status_code = intervention.status() as u16;
+            return Some(StatusCode::from_u16(status_code).unwrap());
+        }
+    }
+    return None;
 }
 
 fn test_modsecurity(ms: &ModSecurity, rules: &Rules) {
