@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, StatusCode},
+    http::{HeaderMap, HeaderName, StatusCode, Version},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
@@ -23,7 +23,7 @@ struct AppState {
 
 #[derive(Parser)]
 struct Args {
-    #[arg(short, long, default_value = "0.0.0.0:8000")]
+    #[arg(short, long, default_value = "0.0.0.0:8080")]
     address: String,
 
     #[arg(short = 'H', long = "header")]
@@ -91,6 +91,7 @@ async fn main() {
     let app = Router::new()
         .route("/", echo.clone())
         .route("/{path}", echo)
+        .route("/speed", post(reply_200()))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             execute_modsecurity,
@@ -106,9 +107,13 @@ async fn main() {
         .unwrap();
 }
 
+fn reply_200() -> StatusCode {
+    StatusCode::OK
+}
+
 // TODO: Actually load the configured rules
 fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
-    let ms = ModSecurity::default();
+    let ms = ModSecurity::builder().with_log_callbacks().build();
 
     let mut rules = Rules::new();
     rules
@@ -145,19 +150,11 @@ async fn execute_modsecurity(
         .ms
         .transaction_builder()
         .with_rules(&state.rules)
+        .with_logging(|_msg| {})
         .build()
         .unwrap();
 
-    println!(
-        "Our request version is {} {:?}",
-        &request.method().to_string(),
-        request.version()
-    );
-
-    let request_http_version = format!("{:?}", request.version())
-        .strip_prefix("HTTP/")
-        .unwrap()
-        .to_string();
+    let request_http_version = map_http_version(request.version());
 
     transaction
         .process_connection("127.0.0.1", 1234, "127.0.0.1", 8080)
@@ -165,14 +162,14 @@ async fn execute_modsecurity(
     transaction
         .process_uri(
             &request.uri().to_string(),
-            &request.method().to_string(),
+            &request.method().as_str(),
             &request_http_version,
         )
         .unwrap();
     for (key, val) in headers.iter() {
-        transaction
-            .add_request_header(&key.to_string(), &val.to_str().unwrap())
-            .unwrap();
+        let key_str = key.as_str();
+        let val_str = val.to_str().unwrap();
+        transaction.add_request_header(key_str, val_str).unwrap();
     }
     transaction.process_request_headers().unwrap();
     if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
@@ -205,9 +202,9 @@ async fn execute_modsecurity(
     let response_http_version = format!("{:?}", response.version()).to_string();
 
     for (key, val) in response.headers().iter() {
-        transaction
-            .add_response_header(&key.to_string(), &val.to_str().unwrap())
-            .unwrap();
+        let key_str = key.as_str();
+        let val_str = val.to_str().unwrap();
+        transaction.add_response_header(key_str, val_str).unwrap();
     }
     transaction
         .process_response_headers(response.status().as_u16().into(), &response_http_version)
@@ -226,7 +223,7 @@ async fn execute_modsecurity(
         .unwrap()
         .to_bytes();
 
-    transaction.append_request_body(&bytes).unwrap();
+    transaction.append_response_body(&bytes).unwrap();
     transaction.process_response_body().unwrap();
 
     if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
@@ -236,14 +233,25 @@ async fn execute_modsecurity(
     let new_body = Body::from(bytes);
     let new_response = Response::from_parts(parts, new_body);
 
-    return Ok(new_response);
+    return std::result::Result::Ok(new_response);
+}
+
+fn map_http_version(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_11 => "1.1",
+        Version::HTTP_2 => "2.0",
+        Version::HTTP_3 => "3.0",
+        _ => panic!("This is not allowed!"),
+    }
 }
 
 fn check_for_intervention(transaction: &mut modsecurity::Transaction) -> Option<StatusCode> {
     if let Some(intervention) = transaction.intervention() {
         if intervention.disruptive() {
             let status_code = intervention.status() as u16;
-            return Some(StatusCode::from_u16(status_code).unwrap());
+            return StatusCode::from_u16(status_code).ok();
         }
     }
     return None;
@@ -269,8 +277,8 @@ fn test_modsecurity(ms: &ModSecurity, rules: &Rules) {
 }
 
 async fn echo(headers: HeaderMap, body: Bytes) -> Result<impl IntoResponse, StatusCode> {
-    if let Ok(body) = String::from_utf8(body.to_vec()) {
-        Ok((headers, body))
+    if let std::result::Result::Ok(body) = String::from_utf8(body.to_vec()) {
+        std::result::Result::Ok((headers, body))
     } else {
         Err(StatusCode::BAD_REQUEST)
     }
