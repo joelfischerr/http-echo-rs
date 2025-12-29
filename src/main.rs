@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use http_body_util::BodyExt;
+use futures_util::StreamExt;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -35,8 +35,11 @@ struct Args {
     #[arg(short = 'd', long = "us-delay", default_value = "0")]
     delay_us: u64,
 
-    #[arg(short = 'r', long = "rules", num_args = 1.., value_delimiter = ' ')]
+    #[arg(short = 'c', long = "config", num_args = 1.., value_delimiter = ' ')]
     rules_vec: Vec<String>,
+
+    #[arg(long = "useWAF")]
+    use_waf: bool,
 }
 
 #[tokio::main]
@@ -50,6 +53,7 @@ async fn main() {
         header_echos,
         delay_us,
         rules_vec,
+        use_waf,
     } = Args::parse();
 
     let headers = headers
@@ -88,14 +92,19 @@ async fn main() {
     let state: Arc<AppState> = configure_modsecurity_to_state(rules_vec);
 
     // build our application with a route
-    let app = Router::new()
+    let mut app: Router = Router::new()
         .route("/", echo.clone())
         .route("/{path}", echo)
-        .route("/speed", post(reply_200()))
-        .route_layer(middleware::from_fn_with_state(
+        .route("/speed", post(reply_200()));
+
+    if use_waf {
+        app = app.route_layer(middleware::from_fn_with_state(
             state.clone(),
             execute_modsecurity,
         ));
+    }
+
+    let app = app;
 
     let listener = tokio::net::TcpListener::bind(address.clone())
         .await
@@ -121,7 +130,7 @@ fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
             r#"
     SecRuleEngine On
 
-    SecRule REQUEST_URI "@rx admin" "id:1,phase:1,deny,status:401"
+    SecRule REQUEST_URI "@rx admin" "id:1101,phase:1,deny,status:401"
 "#,
         )
         .expect("Failed to add rules");
@@ -178,28 +187,33 @@ async fn execute_modsecurity(
 
     let (parts, body) = request.into_parts();
 
-    let bytes: Bytes = body
-        .collect()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
-        .unwrap()
-        .to_bytes();
+    let mut body_chunks = Vec::new();
+    let mut stream = body.into_data_stream();
+
+    while let Some(result) = stream.next().await {
+        if let Ok(chunk) = result {
+            transaction.append_request_body(&chunk[..]).unwrap();
+            body_chunks.push(chunk);
+        }
+    }
 
     // The idea for the body is to get the whole body, do ModSecurity and then copy the body back into the request.
     // This seems super wasteful, but is what axum has in their examples: https://github.com/tokio-rs/axum/blob/3b92cd7593a900d3c79c2aeb411f90be052a9a5c/examples/consume-body-in-extractor-or-middleware/src/main.rs#L58
-    transaction.append_request_body(&bytes).unwrap();
+    // transaction.append_request_body(&bytes).unwrap();
     transaction.process_request_body().unwrap();
 
     if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
         return Err(raw_status_code);
     }
 
-    let new_body = Body::from(bytes);
-    let reassembled_request = Request::from_parts(parts, new_body);
+    let stream_body = Body::from_stream(tokio_stream::iter(
+        body_chunks.into_iter().map(Ok::<Bytes, axum::Error>),
+    ));
+    let reassembled_request = Request::from_parts(parts, stream_body);
 
     let response = next.run(reassembled_request).await;
 
-    let response_http_version = format!("{:?}", response.version()).to_string();
+    let response_http_version = map_http_version(response.version());
 
     for (key, val) in response.headers().iter() {
         let key_str = key.as_str();
@@ -216,21 +230,26 @@ async fn execute_modsecurity(
 
     let (parts, body) = response.into_parts();
 
-    let bytes: Bytes = body
-        .collect()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
-        .unwrap()
-        .to_bytes();
+    let mut body_chunks = Vec::new();
+    let mut stream = body.into_data_stream();
 
-    transaction.append_response_body(&bytes).unwrap();
+    while let Some(result) = stream.next().await {
+        if let Ok(chunk) = result {
+            transaction.append_request_body(&chunk[..]).unwrap();
+            body_chunks.push(chunk);
+        }
+    }
+
     transaction.process_response_body().unwrap();
 
     if let Some(raw_status_code) = check_for_intervention(&mut transaction) {
         return Err(raw_status_code);
     }
 
-    let new_body = Body::from(bytes);
+    let new_body = Body::from_stream(tokio_stream::iter(
+        body_chunks.into_iter().map(Ok::<Bytes, axum::Error>),
+    ));
+
     let new_response = Response::from_parts(parts, new_body);
 
     return std::result::Result::Ok(new_response);
