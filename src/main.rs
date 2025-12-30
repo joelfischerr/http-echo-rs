@@ -5,6 +5,7 @@ use axum::{
     http::{HeaderMap, HeaderName, StatusCode, Version},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    routing::get,
     routing::post,
     Router,
 };
@@ -95,7 +96,10 @@ async fn main() {
     let mut app: Router = Router::new()
         .route("/", echo.clone())
         .route("/{path}", echo)
-        .route("/speed", post(reply_200()));
+        .route("/speed", post(reply_200()))
+        .route("/", get(reply_200()))
+        .route("/speed", get(reply_200()))
+        .route("/{path}", get(reply_200()));
 
     if use_waf {
         app = app.route_layer(middleware::from_fn_with_state(
