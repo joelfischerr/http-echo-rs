@@ -15,6 +15,4 @@ modsecurity = "1.0.0"
 tokio = { version = "1.36.0", features = ["full"] }
 tokio-stream = "0.1.17"
 tracing-subscriber = { version = "^0.3.16", features = ["env-filter"] }
-
-[profile.release]
 #debug = true
