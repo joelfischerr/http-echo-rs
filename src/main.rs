@@ -229,7 +229,6 @@ async fn execute_modsecurity(
 
     log::trace!("Process request headers");
     transaction.process_request_headers().unwrap();
-    // process_logging(&mut transaction, &mut log_file_writer);
 
     {
         let mut log_file_writer = state.log_file.lock().unwrap();
@@ -240,7 +239,6 @@ async fn execute_modsecurity(
             check_for_intervention(&mut transaction, &mut log_file_writer);
             return Err(raw_status_code);
         }
-        process_logging(&mut transaction, &mut log_file_writer);
     }
 
     let (parts, body) = request.into_parts();
@@ -260,7 +258,6 @@ async fn execute_modsecurity(
     // transaction.append_request_body(&bytes).unwrap();
     log::trace!("Process request body");
     transaction.process_request_body().unwrap();
-    // process_logging(&mut transaction, &mut log_file_writer);
 
     {
         let mut log_file_writer = state.log_file.lock().unwrap();
@@ -271,7 +268,6 @@ async fn execute_modsecurity(
             check_for_intervention(&mut transaction, &mut log_file_writer);
             return Err(raw_status_code);
         }
-        process_logging(&mut transaction, &mut log_file_writer);
     }
 
     let stream_body = Body::from_stream(tokio_stream::iter(
@@ -293,7 +289,6 @@ async fn execute_modsecurity(
     transaction
         .process_response_headers(response.status().as_u16().into(), &response_http_version)
         .unwrap();
-    // process_logging(&mut transaction, &mut log_file_writer);
 
     {
         let mut log_file_writer = state.log_file.lock().unwrap();
@@ -304,7 +299,6 @@ async fn execute_modsecurity(
             check_for_intervention(&mut transaction, &mut log_file_writer);
             return Err(raw_status_code);
         }
-        process_logging(&mut transaction, &mut log_file_writer);
     }
 
     let (parts, body) = response.into_parts();
@@ -314,7 +308,7 @@ async fn execute_modsecurity(
 
     while let Some(result) = stream.next().await {
         if let Ok(chunk) = result {
-            transaction.append_request_body(&chunk[..]).unwrap();
+            transaction.append_response_body(&chunk[..]).unwrap();
             body_chunks.push(chunk);
         }
     }
@@ -332,6 +326,11 @@ async fn execute_modsecurity(
         }
     }
 
+    // Phase 5: Logging
+    // Execute the phase 5 rules
+    // We also do this before the premature returns if there were
+    // previous interventions that cause the request to be
+    // immediately dismissed.
     {
         let mut log_file_writer = state.log_file.lock().unwrap();
         process_logging(&mut transaction, &mut log_file_writer);
