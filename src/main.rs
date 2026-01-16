@@ -146,15 +146,6 @@ fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
     let ms = ModSecurity::builder().with_log_callbacks().build();
 
     let mut rules = Rules::new();
-    rules
-        .add_plain(
-            r#"
-    SecRuleEngine On
-
-    SecRule REQUEST_URI "@rx admin" "id:1101,phase:1,deny,status:401"
-"#,
-        )
-        .expect("Failed to add rules");
 
     rules
         .add_plain(
