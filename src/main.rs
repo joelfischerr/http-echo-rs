@@ -2,11 +2,10 @@ use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, StatusCode, Version},
+    http::{self, HeaderMap, HeaderName, StatusCode, Version},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use clap::Parser;
@@ -159,6 +158,25 @@ fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
 
     rules
         .add_plain(
+            r#"SecAction "id:900005,\
+      phase:1,\
+      nolog,\
+      pass,\
+      ctl:ruleEngine=DetectionOnly,\
+      ctl:ruleRemoveById=910000,\
+      setvar:tx.blocking_paranoia_level=4,\
+      setvar:tx.crs_validate_utf8_encoding=1,\
+      setvar:tx.arg_name_length=100,\
+      setvar:tx.arg_length=400,\
+      setvar:tx.total_arg_length=64000,\
+      setvar:tx.max_num_args=255,\
+      setvar:tx.max_file_size=64100,\
+      setvar:tx.combined_file_sizes=65535"#,
+        )
+        .unwrap();
+
+    rules
+        .add_plain(
             r#"
            SecResponseBodyMimeType text/plain
            SecDefaultAction "phase:3,log,auditlog,pass"
@@ -196,9 +214,9 @@ fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
         )
         .expect("Failed to add rules");
 
-    rules
-        .add_plain("SecAuditLog logs/audit/audit-2.log")
-        .expect("Failed to add rules");
+    // rules
+    //     .add_plain("SecAuditLog logs/audit/audit-2.log")
+    //     .expect("Failed to add rules");
 
     // rules
     //     .add_plain(
@@ -262,6 +280,8 @@ async fn execute_modsecurity(
     log::trace!("Processing request with headers {:#?}", headers);
     let movablestate = state.clone();
 
+    let mut status_code: Option<StatusCode> = None;
+
     log::trace!("Processing request");
 
     let mut transaction: Transaction = state
@@ -309,7 +329,13 @@ async fn execute_modsecurity(
 
     for (key, val) in headers.iter() {
         let key_str = key.as_str();
-        let val_str = val.to_str().unwrap_or("");
+
+        if http::HeaderValue::from_bytes(val.as_bytes()).is_err() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // If we we can create a valid header value it is also valid utf-8
+        let val_str = str::from_utf8(val.as_bytes()).unwrap();
         transaction.add_request_header(key_str, val_str).unwrap();
     }
 
@@ -323,7 +349,8 @@ async fn execute_modsecurity(
         {
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            return Err(raw_status_code);
+            // return Err(raw_status_code);
+            status_code = Some(raw_status_code);
         }
     }
 
@@ -352,7 +379,8 @@ async fn execute_modsecurity(
         {
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            return Err(raw_status_code);
+            // return Err(raw_status_code);
+            status_code = Some(raw_status_code);
         }
     }
 
@@ -368,10 +396,17 @@ async fn execute_modsecurity(
     for (key, val) in response.headers().iter() {
         let key_str = key.as_str();
         let val_str = val.to_str().unwrap();
+        log::trace!("Adding response header: {}={}", key_str, val_str);
         transaction.add_response_header(key_str, val_str).unwrap();
     }
 
-    log::trace!("Process response headers");
+    if !response.headers().contains_key("Content-Type") {
+        transaction
+            .add_response_header("Content-Type", "text/plain")
+            .unwrap();
+    }
+
+    log::trace!("Process response headers: {}", response.headers().len());
     transaction
         .process_response_headers(response.status().as_u16().into(), &response_http_version)
         .unwrap();
@@ -383,7 +418,8 @@ async fn execute_modsecurity(
         {
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            return Err(raw_status_code);
+            // return Err(raw_status_code);
+            status_code = Some(raw_status_code);
         }
     }
 
@@ -394,11 +430,13 @@ async fn execute_modsecurity(
 
     while let Some(result) = stream.next().await {
         if let Ok(chunk) = result {
+            log::trace!("Processing body chunk {}", String::from_utf8_lossy(&chunk));
             transaction.append_response_body(&chunk[..]).unwrap();
             body_chunks.push(chunk);
         }
     }
 
+    log::trace!("Start process response body");
     transaction.process_response_body().unwrap();
 
     {
@@ -406,11 +444,20 @@ async fn execute_modsecurity(
         if let Some(raw_status_code) =
             check_for_intervention(&mut transaction, &mut log_file_writer)
         {
+            log::trace!(
+                "Intervention generated when processing response body {}",
+                raw_status_code
+            );
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            return Err(raw_status_code);
+            // return Err(raw_status_code);
+            status_code = Some(raw_status_code);
+        } else {
+            log::trace!("No intervention generated when processing response body");
         }
     }
+
+    log::trace!("Finish process response body");
 
     // Phase 5: Logging
     // Execute the phase 5 rules
@@ -425,6 +472,10 @@ async fn execute_modsecurity(
     let new_body = Body::from_stream(tokio_stream::iter(
         body_chunks.into_iter().map(Ok::<Bytes, axum::Error>),
     ));
+
+    if let Some(status_code) = status_code {
+        return Err(status_code);
+    }
 
     let new_response = Response::from_parts(parts, new_body);
     return std::result::Result::Ok(new_response);
