@@ -19,6 +19,8 @@ use std::io::{BufWriter, Write};
 
 use modsecurity::{transaction::Transaction, ModSecurity, Rules};
 
+use albedo_rust::build_router;
+
 // #[derive(Clone)]
 struct AppState {
     ms: ModSecurity,
@@ -61,54 +63,56 @@ async fn main() {
         use_waf,
     } = Args::parse();
 
-    let headers = headers
-        .unwrap_or(vec![])
-        .iter()
-        .map(|h| {
-            let hs: Vec<&str> = h.split_terminator(":").map(|s| s.trim()).collect();
-            (hs[0].to_string(), hs[1].to_string())
-        })
-        .collect::<HashMap<String, String>>();
-    let header_echos = header_echos.unwrap_or_default();
+    // let headers = headers
+    //     .unwrap_or(vec![])
+    //     .iter()
+    //     .map(|h| {
+    //         let hs: Vec<&str> = h.split_terminator(":").map(|s| s.trim()).collect();
+    //         (hs[0].to_string(), hs[1].to_string())
+    //     })
+    //     .collect::<HashMap<String, String>>();
+    // let header_echos = header_echos.unwrap_or_default();
 
-    let echo = post(move |req_hdrs: HeaderMap, body: Bytes| {
-        log::trace!("Received request: {:?}", req_hdrs);
-        // this helps simulating slower backends
-        if delay_us > 0 {
-            std::thread::sleep(Duration::from_micros(delay_us));
-        }
+    // let echo = post(move |req_hdrs: HeaderMap, body: Bytes| {
+    //     log::trace!("Received request: {:?}", req_hdrs);
+    //     // this helps simulating slower backends
+    //     if delay_us > 0 {
+    //         std::thread::sleep(Duration::from_micros(delay_us));
+    //     }
 
-        let mut res_hdrs = HeaderMap::new();
-        for (key, val) in headers.into_iter() {
-            let key = HeaderName::from_str(key.as_str()).unwrap();
-            res_hdrs.insert(key, val.parse().unwrap());
-        }
+    //     let mut res_hdrs = HeaderMap::new();
+    //     for (key, val) in headers.into_iter() {
+    //         let key = HeaderName::from_str(key.as_str()).unwrap();
+    //         res_hdrs.insert(key, val.parse().unwrap());
+    //     }
 
-        req_hdrs
-            .iter()
-            .filter(|(k, _)| header_echos.contains(&k.to_string()))
-            .for_each(|(k, v)| {
-                res_hdrs.insert(k, v.clone());
-            });
+    //     req_hdrs
+    //         .iter()
+    //         .filter(|(k, _)| header_echos.contains(&k.to_string()))
+    //         .for_each(|(k, v)| {
+    //             res_hdrs.insert(k, v.clone());
+    //         });
 
-        echo(res_hdrs, body)
-    });
+    //     echo(res_hdrs, body)
+    // });
 
     let state: Arc<AppState> = configure_modsecurity_to_state(rules_vec);
 
     // build our application with a route
-    let mut app: Router = Router::new()
-        .route("/", echo.clone())
-        // This only matches one level of nesting!
-        // .route("/{path}", echo)
-        .route("/speed", post(reply_200()))
-        .route("/", get(reply_200()))
-        .route("/speed", get(reply_200()))
-        .route("/{*path}", get(reply_200()));
+    // let mut app: Router = Router::new()
+    //     .route("/", echo.clone())
+    //     // This only matches one level of nesting!
+    //     // .route("/{path}", echo)
+    //     .route("/speed", post(reply_200()))
+    //     .route("/", get(reply_200()))
+    //     .route("/speed", get(reply_200()))
+    //     .route("/{*path}", get(reply_200()));
+
+    let mut app: axum::routing::Router = build_router();
 
     if use_waf {
         println!("Use WAF flag set, configure modsecurity as middleware");
-        app = app.route_layer(middleware::from_fn_with_state(
+        app = app.layer(middleware::from_fn_with_state(
             state.clone(),
             execute_modsecurity,
         ));
@@ -153,7 +157,86 @@ fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
         )
         .expect("Failed to add rules");
 
-    test_modsecurity(&ms, &rules);
+    rules
+        .add_plain(
+            r#"
+           SecResponseBodyMimeType text/plain
+           SecDefaultAction "phase:3,log,auditlog,pass"
+           SecDefaultAction "phase:4,log,auditlog,pass"
+           SecDefaultAction "phase:5,log,auditlog,pass"
+
+           # Rule 900005 from https://github.com/coreruleset/coreruleset/blob/v4.0/dev/tests/regression/README.md#requirements
+           SecAction "id:900005,\
+             phase:1,\
+             nolog,\
+             pass,\
+             ctl:ruleEngine=DetectionOnly,\
+             ctl:ruleRemoveById=910000,\
+             setvar:tx.blocking_paranoia_level=4,\
+             setvar:tx.crs_validate_utf8_encoding=1,\
+             setvar:tx.arg_name_length=100,\
+             setvar:tx.arg_length=400,\
+             setvar:tx.total_arg_length=64000,\
+             setvar:tx.max_num_args=255,\
+             setvar:tx.max_file_size=64100,\
+             setvar:tx.combined_file_sizes=65535"
+
+           # Write the value from the X-CRS-Test header as a marker to the log
+           # Requests with X-CRS-Test header will not be matched by any rule. See https://github.com/coreruleset/go-ftw/pull/133
+           SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
+             "id:999999,\
+             phase:1,\
+             pass,\
+             t:none,\
+             log,\
+             auditlog,\
+             msg:'X-CRS-Test %{MATCHED_VAR}',\
+             ctl:ruleRemoveById=1-999999"
+           "#,
+        )
+        .expect("Failed to add rules");
+
+    rules
+        .add_plain("SecAuditLog logs/audit/audit-2.log")
+        .expect("Failed to add rules");
+
+    // rules
+    //     .add_plain(
+    //         r#"
+    //     SecDebugLog logs/audit/debug.log
+    //     SecDebugLogLevel 9
+    //     "#,
+    //     )
+    //     .unwrap();
+
+    rules
+        .add_plain(
+            r#"# Force Reporting Level to 5 (Unconditional)
+    SecAction \
+        "id:999998,\
+        phase:1,\
+        pass,\
+        nolog,\
+        setvar:tx.reporting_level=5"
+
+        # Inbound and outbound - all requests
+        SecAction \
+            "id:999996,\
+            phase:5,\
+            pass,\
+            t:none,\
+            noauditlog,\
+            severity:'CRITICAL',\
+            msg:'Anomaly Scores: \
+        (Inbound Scores: blocking=%{tx.blocking_inbound_anomaly_score}, detection=%{tx.detection_inbound_anomaly_score}, per_pl=%{tx.inbound_anomaly_score_pl1}-%{tx.inbound_anomaly_score_pl2}-%{tx.inbound_anomaly_score_pl3}-%{tx.inbound_anomaly_score_pl4}, threshold=%{tx.inbound_anomaly_score_threshold}) - \
+        (Outbound Scores: blocking=%{tx.blocking_outbound_anomaly_score}, detection=%{tx.detection_outbound_anomaly_score}, per_pl=%{tx.outbound_anomaly_score_pl1}-%{tx.outbound_anomaly_score_pl2}-%{tx.outbound_anomaly_score_pl3}-%{tx.outbound_anomaly_score_pl4}, threshold=%{tx.outbound_anomaly_score_threshold}) - \
+        (SQLI=%{tx.sql_injection_score}, XSS=%{tx.xss_score}, RFI=%{tx.rfi_score}, LFI=%{tx.lfi_score}, RCE=%{tx.rce_score}, PHPI=%{tx.php_injection_score}, HTTP=%{tx.http_violation_score}, SESS=%{tx.session_fixation_score}, COMBINED_SCORE=%{tx.anomaly_score})',\
+            tag:'reporting',\
+            tag:'OWASP_CRS',\
+            ver:'OWASP_CRS/4.21.0'"
+        "#,
+        )
+        .unwrap();
 
     for rule in rules_vec.iter() {
         println!("Adding rules from file: {}", rule);
@@ -175,8 +258,11 @@ async fn execute_modsecurity(
     request: Request,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
-    // println!("Processing request with headers {:#?}", headers);
+    println!("Processing request with headers {:#?}", headers);
+    log::trace!("Processing request with headers {:#?}", headers);
     let movablestate = state.clone();
+
+    log::trace!("Processing request");
 
     let mut transaction: Transaction = state
         .ms
@@ -379,6 +465,7 @@ fn check_for_intervention(
     transaction: &mut modsecurity::Transaction,
     writer: &mut BufWriter<File>,
 ) -> Option<StatusCode> {
+    log::trace!("Start process intervention!");
     if let Some(intervention) = transaction.intervention() {
         println!(
             "001 Received log: {}",
@@ -392,8 +479,13 @@ fn check_for_intervention(
         if intervention.disruptive() {
             let status_code = intervention.status() as u16;
             return StatusCode::from_u16(status_code).ok();
+        } else {
+            log::trace!("Non-disruptive intervention");
         }
+    } else {
+        log::trace!("No intervention when processing intervention")
     }
+    log::trace!("Finish process intervention!");
     return None;
 }
 
