@@ -271,8 +271,6 @@ async fn execute_modsecurity(
     log::trace!("Processing request with headers {:#?}", headers);
     let movablestate = state.clone();
 
-    let mut status_code: Option<StatusCode> = None;
-
     log::trace!("Processing request");
 
     let mut transaction: Transaction = state
@@ -340,8 +338,7 @@ async fn execute_modsecurity(
         {
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            // return Err(raw_status_code);
-            status_code = Some(raw_status_code);
+            return Err(raw_status_code);
         }
     }
 
@@ -370,8 +367,7 @@ async fn execute_modsecurity(
         {
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            // return Err(raw_status_code);
-            status_code = Some(raw_status_code);
+            return Err(raw_status_code);
         }
     }
 
@@ -409,8 +405,7 @@ async fn execute_modsecurity(
         {
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            // return Err(raw_status_code);
-            status_code = Some(raw_status_code);
+            return Err(raw_status_code);
         }
     }
 
@@ -441,8 +436,7 @@ async fn execute_modsecurity(
             );
             process_logging(&mut transaction, &mut log_file_writer);
             check_for_intervention(&mut transaction, &mut log_file_writer);
-            // return Err(raw_status_code);
-            status_code = Some(raw_status_code);
+            return Err(raw_status_code);
         } else {
             log::trace!("No intervention generated when processing response body");
         }
@@ -463,10 +457,6 @@ async fn execute_modsecurity(
     let new_body = Body::from_stream(tokio_stream::iter(
         body_chunks.into_iter().map(Ok::<Bytes, axum::Error>),
     ));
-
-    if let Some(status_code) = status_code {
-        return Err(status_code);
-    }
 
     let new_response = Response::from_parts(parts, new_body);
     return std::result::Result::Ok(new_response);
