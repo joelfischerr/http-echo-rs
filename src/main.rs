@@ -18,7 +18,7 @@ use std::io::{BufWriter, Write};
 
 use modsecurity::{transaction::Transaction, ModSecurity, Rules};
 
-use albedo_rust::build_router;
+use albedo_rs::build_router;
 
 // #[derive(Clone)]
 struct AppState {
