@@ -2,29 +2,30 @@ use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{self, HeaderMap, HeaderName, StatusCode, Version},
+    http::{self, HeaderMap, StatusCode, Version},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Router,
+    response::Response,
 };
 use clap::Parser;
+use crossbeam::channel::Sender;
 use futures_util::StreamExt;
-use std::{collections::HashMap, str::FromStr, sync::Arc, sync::Mutex, time::Duration};
+use std::{sync::Arc, thread};
 use tokio::signal::unix::{signal, SignalKind};
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 
 use modsecurity::{transaction::Transaction, ModSecurity, Rules};
 
 use albedo_rs::build_router;
 
+type InnerChannelType = Box<str>;
+
 // #[derive(Clone)]
 struct AppState {
     ms: ModSecurity,
     rules: Rules,
-    log_file: Arc<Mutex<BufWriter<File>>>,
+    log_file: Arc<Sender<InnerChannelType>>,
 }
 
 #[derive(Parser)]
@@ -53,64 +54,44 @@ async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
+    let log_file_location = "logs/audit/audit.log";
+
+    // let (tx, rx) = mpsc::channel::<InnerChannelType();
+    let (tx, rx) = crossbeam::channel::bounded::<InnerChannelType>(100_000);
+
+    thread::spawn(move || {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file_location)
+            .unwrap();
+        // Increasing the capacity can increase performance, but increasing it too much will break the go-ftw tests.
+        let mut writer = BufWriter::with_capacity(8 * 1024, file);
+
+        // blocks until messages arrive
+        // when tx is dropped this exists
+        for msg in rx {
+            // let _ = writeln!(writer, "Log: {}", msg);
+            let _ = writer.write_all(msg.as_bytes());
+        }
+        writer.flush().unwrap();
+    });
+
     let Args {
         address,
-        headers,
-        header_echos,
-        delay_us,
+        headers: _,
+        header_echos: _,
+        delay_us: _,
         rules_vec,
         use_waf,
     } = Args::parse();
 
-    // let headers = headers
-    //     .unwrap_or(vec![])
-    //     .iter()
-    //     .map(|h| {
-    //         let hs: Vec<&str> = h.split_terminator(":").map(|s| s.trim()).collect();
-    //         (hs[0].to_string(), hs[1].to_string())
-    //     })
-    //     .collect::<HashMap<String, String>>();
-    // let header_echos = header_echos.unwrap_or_default();
-
-    // let echo = post(move |req_hdrs: HeaderMap, body: Bytes| {
-    //     log::trace!("Received request: {:?}", req_hdrs);
-    //     // this helps simulating slower backends
-    //     if delay_us > 0 {
-    //         std::thread::sleep(Duration::from_micros(delay_us));
-    //     }
-
-    //     let mut res_hdrs = HeaderMap::new();
-    //     for (key, val) in headers.into_iter() {
-    //         let key = HeaderName::from_str(key.as_str()).unwrap();
-    //         res_hdrs.insert(key, val.parse().unwrap());
-    //     }
-
-    //     req_hdrs
-    //         .iter()
-    //         .filter(|(k, _)| header_echos.contains(&k.to_string()))
-    //         .for_each(|(k, v)| {
-    //             res_hdrs.insert(k, v.clone());
-    //         });
-
-    //     echo(res_hdrs, body)
-    // });
-
-    let state: Arc<AppState> = configure_modsecurity_to_state(rules_vec);
-
-    // build our application with a route
-    // let mut app: Router = Router::new()
-    //     .route("/", echo.clone())
-    //     // This only matches one level of nesting!
-    //     // .route("/{path}", echo)
-    //     .route("/speed", post(reply_200()))
-    //     .route("/", get(reply_200()))
-    //     .route("/speed", get(reply_200()))
-    //     .route("/{*path}", get(reply_200()));
+    let state: Arc<AppState> = configure_modsecurity_to_state(tx, rules_vec);
 
     let mut app: axum::routing::Router = build_router();
 
     if use_waf {
-        println!("Use WAF flag set, configure modsecurity as middleware");
+        // log::trace!("Use WAF flag set, configure modsecurity as middleware");
         app = app.layer(middleware::from_fn_with_state(
             state.clone(),
             execute_modsecurity,
@@ -129,20 +110,10 @@ async fn main() {
         .unwrap();
 }
 
-fn reply_200() -> StatusCode {
-    StatusCode::OK
-}
-
-// TODO: Actually load the configured rules
-fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
-    let file: File = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("logs/audit/audit.log")
-        .unwrap();
-
-    let writer: BufWriter<File> = BufWriter::new(file);
-
+fn configure_modsecurity_to_state(
+    tx: Sender<InnerChannelType>,
+    rules_vec: Vec<String>,
+) -> Arc<AppState> {
     let ms = ModSecurity::builder().with_log_callbacks().build();
 
     let mut rules = Rules::new();
@@ -205,19 +176,6 @@ fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
         )
         .expect("Failed to add rules");
 
-    // rules
-    //     .add_plain("SecAuditLog logs/audit/audit-2.log")
-    //     .expect("Failed to add rules");
-
-    // rules
-    //     .add_plain(
-    //         r#"
-    //     SecDebugLog logs/audit/debug.log
-    //     SecDebugLogLevel 9
-    //     "#,
-    //     )
-    //     .unwrap();
-
     rules
         .add_plain(
             r#"# Force Reporting Level to 5 (Unconditional)
@@ -248,14 +206,15 @@ fn configure_modsecurity_to_state(rules_vec: Vec<String>) -> Arc<AppState> {
         .unwrap();
 
     for rule in rules_vec.iter() {
-        println!("Adding rules from file: {}", rule);
+        // log::trace!("Adding rules from file: {}", rule);
         rules.add_file(rule).expect("Adding rules failed!");
     }
 
     let state = Arc::new(AppState {
         ms: ms,
         rules: rules,
-        log_file: Arc::new(Mutex::new(writer)),
+        // log_file: Arc::new(Mutex::new(tx)),
+        log_file: Arc::new(tx),
     });
 
     return state;
@@ -267,47 +226,35 @@ async fn execute_modsecurity(
     request: Request,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
-    println!("Processing request with headers {:#?}", headers);
-    log::trace!("Processing request with headers {:#?}", headers);
+    // log::trace!("Processing request with headers {:#?}", headers);
     let movablestate = state.clone();
+    let movedstate = state.clone();
 
-    log::trace!("Processing request");
-
-    let mut transaction: Transaction = state
+    let mut transaction: Transaction = movablestate
         .ms
         .transaction_builder()
-        .with_rules(&state.rules)
-        .with_logging(move |_msg| {
-            log::trace!("Log callback called!");
-            println!("002 Received log: {}", _msg.unwrap_or_default());
-
-            let mut log_file_writer = movablestate.log_file.lock().unwrap();
-            writeln!(
-                log_file_writer,
-                "002 Received log: {}",
-                _msg.unwrap_or_default()
-            )
-            .unwrap();
-
-            // TODO: This is super inefficient. We should flush opportunistically after the response.
-            log_file_writer.flush().unwrap();
+        .with_rules(&movablestate.rules)
+        .with_logging(move |_msg: Option<&str>| {
+            if let Some(_msg) = _msg {
+                let _ = movedstate.log_file.send(_msg.into());
+            }
         })
         .build()
         .unwrap();
 
     let request_http_version = map_http_version(request.version());
 
-    println!(
-        "Processing request with http version {}",
-        request_http_version
-    );
+    // log::trace!(
+    // "Processing request with http version {}",
+    // request_http_version
+    // );
 
-    log::trace!("Process connection");
+    // log::trace!("Process connection");
     transaction
         .process_connection("127.0.0.1", 1234, "127.0.0.1", 8080)
         .unwrap();
 
-    log::trace!("Process uri");
+    // log::trace!("Process uri");
     transaction
         .process_uri(
             &request.uri().to_string(),
@@ -328,16 +275,14 @@ async fn execute_modsecurity(
         transaction.add_request_header(key_str, val_str).unwrap();
     }
 
-    log::trace!("Process request headers");
+    // log::trace!("Process request headers");
     transaction.process_request_headers().unwrap();
 
     {
-        let mut log_file_writer = state.log_file.lock().unwrap();
-        if let Some(raw_status_code) =
-            check_for_intervention(&mut transaction, &mut log_file_writer)
-        {
-            process_logging(&mut transaction, &mut log_file_writer);
-            check_for_intervention(&mut transaction, &mut log_file_writer);
+        // let mut log_file_writer = state;
+        if let Some(raw_status_code) = check_for_intervention(&mut transaction, &state) {
+            process_logging(&mut transaction, &state);
+            check_for_intervention(&mut transaction, &state);
             return Err(raw_status_code);
         }
     }
@@ -357,16 +302,14 @@ async fn execute_modsecurity(
     // The idea for the body is to get the whole body, do ModSecurity and then copy the body back into the request.
     // This seems super wasteful, but is what axum has in their examples: https://github.com/tokio-rs/axum/blob/3b92cd7593a900d3c79c2aeb411f90be052a9a5c/examples/consume-body-in-extractor-or-middleware/src/main.rs#L58
     // transaction.append_request_body(&bytes).unwrap();
-    log::trace!("Process request body");
+    // log::trace!("Process request body");
     transaction.process_request_body().unwrap();
 
     {
-        let mut log_file_writer = state.log_file.lock().unwrap();
-        if let Some(raw_status_code) =
-            check_for_intervention(&mut transaction, &mut log_file_writer)
-        {
-            process_logging(&mut transaction, &mut log_file_writer);
-            check_for_intervention(&mut transaction, &mut log_file_writer);
+        // let mut log_file_writer = state.log_file;
+        if let Some(raw_status_code) = check_for_intervention(&mut transaction, &state) {
+            process_logging(&mut transaction, &state);
+            check_for_intervention(&mut transaction, &state);
             return Err(raw_status_code);
         }
     }
@@ -383,7 +326,7 @@ async fn execute_modsecurity(
     for (key, val) in response.headers().iter() {
         let key_str = key.as_str();
         let val_str = val.to_str().unwrap();
-        log::trace!("Adding response header: {}={}", key_str, val_str);
+        // log::trace!("Adding response header: {}={}", key_str, val_str);
         transaction.add_response_header(key_str, val_str).unwrap();
     }
 
@@ -393,18 +336,15 @@ async fn execute_modsecurity(
             .unwrap();
     }
 
-    log::trace!("Process response headers: {}", response.headers().len());
+    // log::trace!("Process response headers: {}", response.headers().len());
     transaction
         .process_response_headers(response.status().as_u16().into(), &response_http_version)
         .unwrap();
 
     {
-        let mut log_file_writer = state.log_file.lock().unwrap();
-        if let Some(raw_status_code) =
-            check_for_intervention(&mut transaction, &mut log_file_writer)
-        {
-            process_logging(&mut transaction, &mut log_file_writer);
-            check_for_intervention(&mut transaction, &mut log_file_writer);
+        if let Some(raw_status_code) = check_for_intervention(&mut transaction, &state) {
+            process_logging(&mut transaction, &state);
+            check_for_intervention(&mut transaction, &state);
             return Err(raw_status_code);
         }
     }
@@ -416,33 +356,30 @@ async fn execute_modsecurity(
 
     while let Some(result) = stream.next().await {
         if let Ok(chunk) = result {
-            log::trace!("Processing body chunk {}", String::from_utf8_lossy(&chunk));
+            // log::trace!("Processing body chunk {}", String::from_utf8_lossy(&chunk));
             transaction.append_response_body(&chunk[..]).unwrap();
             body_chunks.push(chunk);
         }
     }
 
-    log::trace!("Start process response body");
+    // log::trace!("Start process response body");
     transaction.process_response_body().unwrap();
 
     {
-        let mut log_file_writer = state.log_file.lock().unwrap();
-        if let Some(raw_status_code) =
-            check_for_intervention(&mut transaction, &mut log_file_writer)
-        {
-            log::trace!(
-                "Intervention generated when processing response body {}",
-                raw_status_code
-            );
-            process_logging(&mut transaction, &mut log_file_writer);
-            check_for_intervention(&mut transaction, &mut log_file_writer);
+        if let Some(raw_status_code) = check_for_intervention(&mut transaction, &state) {
+            // log::trace!(
+            // "Intervention generated when processing response body {}",
+            // raw_status_code
+            // );
+            process_logging(&mut transaction, &state);
+            check_for_intervention(&mut transaction, &state);
             return Err(raw_status_code);
         } else {
-            log::trace!("No intervention generated when processing response body");
+            // log::trace!("No intervention generated when processing response body");
         }
     }
 
-    log::trace!("Finish process response body");
+    // log::trace!("Finish process response body");
 
     // Phase 5: Logging
     // Execute the phase 5 rules
@@ -450,8 +387,7 @@ async fn execute_modsecurity(
     // previous interventions that cause the request to be
     // immediately dismissed.
     {
-        let mut log_file_writer = state.log_file.lock().unwrap();
-        process_logging(&mut transaction, &mut log_file_writer);
+        process_logging(&mut transaction, &state);
     }
 
     let new_body = Body::from_stream(tokio_stream::iter(
@@ -473,51 +409,49 @@ fn map_http_version(version: Version) -> &'static str {
     }
 }
 
-fn process_logging(transaction: &mut modsecurity::Transaction, writer: &mut BufWriter<File>) {
-    log::trace!("Start process logging!");
+fn process_logging(transaction: &mut modsecurity::Transaction, app_state: &Arc<AppState>) {
+    // log::trace!("Start process logging!");
     transaction.process_logging().unwrap();
     // Apparently this triggers the log callback ...
     if let Some(intervention) = transaction.intervention() {
         if let Some(log) = intervention.log() {
-            println!("004 Received log: {}", log);
+            // log::trace!("004 Received log: {}", log);
 
-            writeln!(writer, "004 Received log: {}", log).unwrap();
-            // TODO: This is super inefficient. We should flush opportunistically after the response.
-            writer.flush().unwrap();
+            let _ = app_state.log_file.send(log.into());
         } else {
-            log::trace!("No log when processing logging")
+            // log::trace!("No log when processing logging")
         }
     } else {
-        log::trace!("No intervention when processing logging")
+        // log::trace!("No intervention when processing logging")
     }
-    log::trace!("Finish process logging!")
+    // log::trace!("Finish process logging!")
 }
 
 fn check_for_intervention(
     transaction: &mut modsecurity::Transaction,
-    writer: &mut BufWriter<File>,
+    app_state: &Arc<AppState>,
 ) -> Option<StatusCode> {
-    log::trace!("Start process intervention!");
+    // log::trace!("Start process intervention!");
     if let Some(intervention) = transaction.intervention() {
-        println!(
-            "001 Received log: {}",
-            intervention.log().expect("Expected log")
-        );
+        // log::trace!(
+        // "001 Received log: {}",
+        // intervention.log().expect("Expected log")
+        // );
 
-        writeln!(writer, "001 Received log: {}", intervention.log().unwrap()).unwrap();
-        // TODO: This is super inefficient. We should flush opportunistically after the response.
-        writer.flush().unwrap();
+        if let Some(log) = intervention.log() {
+            let _ = app_state.log_file.send(log.into());
+        }
 
         if intervention.disruptive() {
             let status_code = intervention.status() as u16;
             return StatusCode::from_u16(status_code).ok();
         } else {
-            log::trace!("Non-disruptive intervention");
+            // log::trace!("Non-disruptive intervention");
         }
     } else {
-        log::trace!("No intervention when processing intervention")
+        // log::trace!("No intervention when processing intervention")
     }
-    log::trace!("Finish process intervention!");
+    // log::trace!("Finish process intervention!");
     return None;
 }
 
@@ -538,14 +472,6 @@ fn test_modsecurity(ms: &ModSecurity, rules: &Rules) {
     let intervention = transaction.intervention().expect("Expected intervention");
 
     assert_eq!(intervention.status(), 401);
-}
-
-async fn echo(headers: HeaderMap, body: Bytes) -> Result<impl IntoResponse, StatusCode> {
-    if let std::result::Result::Ok(body) = String::from_utf8(body.to_vec()) {
-        std::result::Result::Ok((headers, body))
-    } else {
-        Err(StatusCode::BAD_REQUEST)
-    }
 }
 
 async fn shutdown_signal() {
