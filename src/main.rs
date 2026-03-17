@@ -7,7 +7,7 @@ use axum::{
     response::Response,
 };
 use clap::Parser;
-use crossbeam::channel::Sender;
+use crossbeam::channel::{Receiver, Sender};
 use futures_util::StreamExt;
 use std::{sync::Arc, thread};
 use tokio::signal::unix::{signal, SignalKind};
@@ -57,22 +57,24 @@ async fn main() {
     let log_file_location = "logs/audit/audit.log";
 
     // let (tx, rx) = mpsc::channel::<InnerChannelType();
-    let (tx, rx) = crossbeam::channel::bounded::<InnerChannelType>(100_000);
+    // let (tx, rx) = crossbeam::channel::unbounded::<InnerChannelType>(100_000_000);
+    let (tx, rx): (Sender<InnerChannelType>, Receiver<InnerChannelType>) =
+        crossbeam::channel::unbounded();
 
     thread::spawn(move || {
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
             .open(log_file_location)
             .unwrap();
         // Increasing the capacity can increase performance, but increasing it too much will break the go-ftw tests.
-        let mut writer = BufWriter::with_capacity(8 * 1024, file);
+        let mut writer = BufWriter::with_capacity(4 * 1024, file);
 
         // blocks until messages arrive
         // when tx is dropped this exists
         for msg in rx {
-            // let _ = writeln!(writer, "Log: {}", msg);
             let _ = writer.write_all(msg.as_bytes());
+            let _ = writer.write_all("\n".as_bytes());
         }
         writer.flush().unwrap();
     });
@@ -91,7 +93,7 @@ async fn main() {
     let mut app: axum::routing::Router = build_router();
 
     if use_waf {
-        // log::trace!("Use WAF flag set, configure modsecurity as middleware");
+        log::trace!("Use WAF flag set, configure modsecurity as middleware");
         app = app.layer(middleware::from_fn_with_state(
             state.clone(),
             execute_modsecurity,
@@ -206,7 +208,7 @@ fn configure_modsecurity_to_state(
         .unwrap();
 
     for rule in rules_vec.iter() {
-        // log::trace!("Adding rules from file: {}", rule);
+        log::trace!("Adding rules from file: {}", rule);
         rules.add_file(rule).expect("Adding rules failed!");
     }
 
@@ -226,7 +228,7 @@ async fn execute_modsecurity(
     request: Request,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
-    // log::trace!("Processing request with headers {:#?}", headers);
+    log::trace!("Processing request with headers {:#?}", headers);
     let movablestate = state.clone();
     let movedstate = state.clone();
 
@@ -244,17 +246,17 @@ async fn execute_modsecurity(
 
     let request_http_version = map_http_version(request.version());
 
-    // log::trace!(
-    // "Processing request with http version {}",
-    // request_http_version
-    // );
+    log::trace!(
+        "Processing request with http version {}",
+        request_http_version
+    );
 
-    // log::trace!("Process connection");
+    log::trace!("Process connection");
     transaction
         .process_connection("127.0.0.1", 1234, "127.0.0.1", 8080)
         .unwrap();
 
-    // log::trace!("Process uri");
+    log::trace!("Process uri");
     transaction
         .process_uri(
             &request.uri().to_string(),
@@ -275,7 +277,7 @@ async fn execute_modsecurity(
         transaction.add_request_header(key_str, val_str).unwrap();
     }
 
-    // log::trace!("Process request headers");
+    log::trace!("Process request headers");
     transaction.process_request_headers().unwrap();
 
     {
@@ -302,7 +304,7 @@ async fn execute_modsecurity(
     // The idea for the body is to get the whole body, do ModSecurity and then copy the body back into the request.
     // This seems super wasteful, but is what axum has in their examples: https://github.com/tokio-rs/axum/blob/3b92cd7593a900d3c79c2aeb411f90be052a9a5c/examples/consume-body-in-extractor-or-middleware/src/main.rs#L58
     // transaction.append_request_body(&bytes).unwrap();
-    // log::trace!("Process request body");
+    log::trace!("Process request body");
     transaction.process_request_body().unwrap();
 
     {
@@ -326,7 +328,7 @@ async fn execute_modsecurity(
     for (key, val) in response.headers().iter() {
         let key_str = key.as_str();
         let val_str = val.to_str().unwrap();
-        // log::trace!("Adding response header: {}={}", key_str, val_str);
+        log::trace!("Adding response header: {}={}", key_str, val_str);
         transaction.add_response_header(key_str, val_str).unwrap();
     }
 
@@ -336,7 +338,7 @@ async fn execute_modsecurity(
             .unwrap();
     }
 
-    // log::trace!("Process response headers: {}", response.headers().len());
+    log::trace!("Process response headers: {}", response.headers().len());
     transaction
         .process_response_headers(response.status().as_u16().into(), &response_http_version)
         .unwrap();
@@ -356,30 +358,30 @@ async fn execute_modsecurity(
 
     while let Some(result) = stream.next().await {
         if let Ok(chunk) = result {
-            // log::trace!("Processing body chunk {}", String::from_utf8_lossy(&chunk));
+            log::trace!("Processing body chunk {}", String::from_utf8_lossy(&chunk));
             transaction.append_response_body(&chunk[..]).unwrap();
             body_chunks.push(chunk);
         }
     }
 
-    // log::trace!("Start process response body");
+    log::trace!("Start process response body");
     transaction.process_response_body().unwrap();
 
     {
         if let Some(raw_status_code) = check_for_intervention(&mut transaction, &state) {
-            // log::trace!(
-            // "Intervention generated when processing response body {}",
-            // raw_status_code
-            // );
+            log::trace!(
+                "Intervention generated when processing response body {}",
+                raw_status_code
+            );
             process_logging(&mut transaction, &state);
             check_for_intervention(&mut transaction, &state);
             return Err(raw_status_code);
         } else {
-            // log::trace!("No intervention generated when processing response body");
+            log::trace!("No intervention generated when processing response body");
         }
     }
 
-    // log::trace!("Finish process response body");
+    log::trace!("Finish process response body");
 
     // Phase 5: Logging
     // Execute the phase 5 rules
@@ -410,33 +412,33 @@ fn map_http_version(version: Version) -> &'static str {
 }
 
 fn process_logging(transaction: &mut modsecurity::Transaction, app_state: &Arc<AppState>) {
-    // log::trace!("Start process logging!");
+    log::trace!("Start process logging!");
     transaction.process_logging().unwrap();
     // Apparently this triggers the log callback ...
     if let Some(intervention) = transaction.intervention() {
         if let Some(log) = intervention.log() {
-            // log::trace!("004 Received log: {}", log);
+            log::trace!("004 Received log: {}", log);
 
             let _ = app_state.log_file.send(log.into());
         } else {
-            // log::trace!("No log when processing logging")
+            log::trace!("No log when processing logging")
         }
     } else {
-        // log::trace!("No intervention when processing logging")
+        log::trace!("No intervention when processing logging")
     }
-    // log::trace!("Finish process logging!")
+    log::trace!("Finish process logging!")
 }
 
 fn check_for_intervention(
     transaction: &mut modsecurity::Transaction,
     app_state: &Arc<AppState>,
 ) -> Option<StatusCode> {
-    // log::trace!("Start process intervention!");
+    log::trace!("Start process intervention!");
     if let Some(intervention) = transaction.intervention() {
-        // log::trace!(
-        // "001 Received log: {}",
-        // intervention.log().expect("Expected log")
-        // );
+        log::trace!(
+            "001 Received log: {}",
+            intervention.log().expect("Expected log")
+        );
 
         if let Some(log) = intervention.log() {
             let _ = app_state.log_file.send(log.into());
@@ -446,12 +448,12 @@ fn check_for_intervention(
             let status_code = intervention.status() as u16;
             return StatusCode::from_u16(status_code).ok();
         } else {
-            // log::trace!("Non-disruptive intervention");
+            log::trace!("Non-disruptive intervention");
         }
     } else {
-        // log::trace!("No intervention when processing intervention")
+        log::trace!("No intervention when processing intervention")
     }
-    // log::trace!("Finish process intervention!");
+    log::trace!("Finish process intervention!");
     return None;
 }
 
