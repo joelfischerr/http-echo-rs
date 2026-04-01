@@ -93,7 +93,7 @@ async fn main() {
     let mut app: axum::routing::Router = build_router();
 
     if use_waf {
-        log::trace!("Use WAF flag set, configure modsecurity as middleware");
+        println!("Use WAF flag set, configure modsecurity as middleware");
         app = app.layer(middleware::from_fn_with_state(
             state.clone(),
             execute_modsecurity,
@@ -105,7 +105,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(address.clone())
         .await
         .unwrap();
-    log::info!("Listening on {}", address);
+    println!("Listening on {}", address);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -120,95 +120,8 @@ fn configure_modsecurity_to_state(
 
     let mut rules = Rules::new();
 
-    rules
-        .add_plain(
-            r#"SecAction "id:900005,\
-      phase:1,\
-      nolog,\
-      pass,\
-      ctl:ruleEngine=DetectionOnly,\
-      ctl:ruleRemoveById=910000,\
-      setvar:tx.blocking_paranoia_level=4,\
-      setvar:tx.crs_validate_utf8_encoding=1,\
-      setvar:tx.arg_name_length=100,\
-      setvar:tx.arg_length=400,\
-      setvar:tx.total_arg_length=64000,\
-      setvar:tx.max_num_args=255,\
-      setvar:tx.max_file_size=64100,\
-      setvar:tx.combined_file_sizes=65535"#,
-        )
-        .unwrap();
-
-    rules
-        .add_plain(
-            r#"
-           SecResponseBodyMimeType text/plain
-           SecDefaultAction "phase:3,log,auditlog,pass"
-           SecDefaultAction "phase:4,log,auditlog,pass"
-           SecDefaultAction "phase:5,log,auditlog,pass"
-
-           # Rule 900005 from https://github.com/coreruleset/coreruleset/blob/v4.0/dev/tests/regression/README.md#requirements
-           SecAction "id:900005,\
-             phase:1,\
-             nolog,\
-             pass,\
-             ctl:ruleEngine=DetectionOnly,\
-             ctl:ruleRemoveById=910000,\
-             setvar:tx.blocking_paranoia_level=4,\
-             setvar:tx.crs_validate_utf8_encoding=1,\
-             setvar:tx.arg_name_length=100,\
-             setvar:tx.arg_length=400,\
-             setvar:tx.total_arg_length=64000,\
-             setvar:tx.max_num_args=255,\
-             setvar:tx.max_file_size=64100,\
-             setvar:tx.combined_file_sizes=65535"
-
-           # Write the value from the X-CRS-Test header as a marker to the log
-           # Requests with X-CRS-Test header will not be matched by any rule. See https://github.com/coreruleset/go-ftw/pull/133
-           SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
-             "id:999999,\
-             phase:1,\
-             pass,\
-             t:none,\
-             log,\
-             auditlog,\
-             msg:'X-CRS-Test %{MATCHED_VAR}',\
-             ctl:ruleRemoveById=1-999999"
-           "#,
-        )
-        .expect("Failed to add rules");
-
-    rules
-        .add_plain(
-            r#"# Force Reporting Level to 5 (Unconditional)
-    SecAction \
-        "id:999998,\
-        phase:1,\
-        pass,\
-        nolog,\
-        setvar:tx.reporting_level=5"
-
-        # Inbound and outbound - all requests
-        SecAction \
-            "id:999996,\
-            phase:5,\
-            pass,\
-            t:none,\
-            noauditlog,\
-            severity:'CRITICAL',\
-            msg:'Anomaly Scores: \
-        (Inbound Scores: blocking=%{tx.blocking_inbound_anomaly_score}, detection=%{tx.detection_inbound_anomaly_score}, per_pl=%{tx.inbound_anomaly_score_pl1}-%{tx.inbound_anomaly_score_pl2}-%{tx.inbound_anomaly_score_pl3}-%{tx.inbound_anomaly_score_pl4}, threshold=%{tx.inbound_anomaly_score_threshold}) - \
-        (Outbound Scores: blocking=%{tx.blocking_outbound_anomaly_score}, detection=%{tx.detection_outbound_anomaly_score}, per_pl=%{tx.outbound_anomaly_score_pl1}-%{tx.outbound_anomaly_score_pl2}-%{tx.outbound_anomaly_score_pl3}-%{tx.outbound_anomaly_score_pl4}, threshold=%{tx.outbound_anomaly_score_threshold}) - \
-        (SQLI=%{tx.sql_injection_score}, XSS=%{tx.xss_score}, RFI=%{tx.rfi_score}, LFI=%{tx.lfi_score}, RCE=%{tx.rce_score}, PHPI=%{tx.php_injection_score}, HTTP=%{tx.http_violation_score}, SESS=%{tx.session_fixation_score}, COMBINED_SCORE=%{tx.anomaly_score})',\
-            tag:'reporting',\
-            tag:'OWASP_CRS',\
-            ver:'OWASP_CRS/4.21.0'"
-        "#,
-        )
-        .unwrap();
-
     for rule in rules_vec.iter() {
-        log::trace!("Adding rules from file: {}", rule);
+        println!("Adding rules from file: {}", rule);
         rules.add_file(rule).expect("Adding rules failed!");
     }
 
@@ -236,11 +149,11 @@ async fn execute_modsecurity(
         .ms
         .transaction_builder()
         .with_rules(&movablestate.rules)
-        .with_logging(move |_msg: Option<&str>| {
-            if let Some(_msg) = _msg {
-                let _ = movedstate.log_file.send(_msg.into());
-            }
-        })
+        // .with_logging(move |_msg: Option<&str>| {
+        // if let Some(_msg) = _msg {
+        // let _ = movedstate.log_file.send(_msg.into());
+        // }
+        // })
         .build()
         .unwrap();
 
@@ -419,7 +332,7 @@ fn process_logging(transaction: &mut modsecurity::Transaction, app_state: &Arc<A
         if let Some(log) = intervention.log() {
             log::trace!("004 Received log: {}", log);
 
-            let _ = app_state.log_file.send(log.into());
+            // let _ = app_state.log_file.send(log.into());
         } else {
             log::trace!("No log when processing logging")
         }
@@ -441,7 +354,7 @@ fn check_for_intervention(
         );
 
         if let Some(log) = intervention.log() {
-            let _ = app_state.log_file.send(log.into());
+            // let _ = app_state.log_file.send(log.into());
         }
 
         if intervention.disruptive() {
